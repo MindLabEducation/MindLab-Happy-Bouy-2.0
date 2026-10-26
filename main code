@@ -1,0 +1,480 @@
+#include <OneWireHub.h>
+#include "thingProperties.h"
+#include <SoftwareSerial.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define TDS_SENSOR_PIN A0
+#define TURBIDITY_PIN A1
+#define TEMPERATURE_SENSOR_PIN A2
+#define BUTTON_PIN 2
+#define LED_PIN 13
+// NEO-6M GPS
+// GPS TX -> Arduino pin 3
+// GPS RX -> Arduino pin 4
+SoftwareSerial gpsSerial(3, 4);
+
+OneWire oneWire(TEMPERATURE_SENSOR_PIN);
+DallasTemperature temperatureSensor(&oneWire);
+
+#define VREF 5.0
+#define SCOUNT 30
+
+int analogBuffer[SCOUNT];
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+int butto = 0;
+
+float averageVoltage = 0.0;
+float tds = 0.0;
+
+float turbidityNTU = 0.0;
+float turbidityVoltage = 0.0;
+
+float measuredTemperature = 0.0;
+
+int lastButtonState = HIGH;
+
+String gpsLine = "";
+
+float latitude = 0.0;
+float longitude = 0.0;
+
+bool gpsFix = false;
+
+unsigned long lastTDSTime = 0;
+unsigned long lastTurbidityTime = 0;
+unsigned long lastTemperatureTime = 0;
+unsigned long lastPrintTime = 0;
+unsigned long lastMessengerTime = 0;
+const unsigned long MESSENGER_INTERVAL = 10000;
+
+int getMedianNum(int bArray[], int iFilterLen)
+{
+  int bTab[iFilterLen];
+
+  for (byte i = 0; i < iFilterLen; i++)
+  {
+    bTab[i] = bArray[i];
+  }
+
+  int i, j, bTemp;
+
+  for (j = 0; j < iFilterLen - 1; j++)
+  {
+    for (i = 0; i < iFilterLen - j - 1; i++)
+    {
+      if (bTab[i] > bTab[i + 1])
+      {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+
+  if ((iFilterLen & 1) > 0)
+  {
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  }
+  else
+  {
+    bTemp =
+      (bTab[iFilterLen / 2] +
+       bTab[iFilterLen / 2 - 1]) / 2;
+  }
+
+  return bTemp;
+}
+
+void processGPS()
+{
+  while (gpsSerial.available())
+  {
+    char c = gpsSerial.read();
+
+    if (c == '\n')
+    {
+      gpsLine.trim();
+
+      if (gpsLine.startsWith("$GPGGA"))
+      {
+        parseGPGGA(gpsLine);
+      }
+
+      if (gpsLine.startsWith("$GNGGA"))
+      {
+        parseGPGGA(gpsLine);
+      }
+
+      gpsLine = "";
+    }
+    else
+    {
+      gpsLine += c;
+
+      if (gpsLine.length() > 120)
+      {
+        gpsLine = "";
+      }
+    }
+  }
+}
+
+void parseGPGGA(String sentence)
+{
+  char buffer[150];
+
+  sentence.toCharArray(buffer, sizeof(buffer));
+
+  char *token;
+  int field = 0;
+
+  String latitudeString = "";
+  String longitudeString = "";
+
+  char latitudeDirection = 'N';
+  char longitudeDirection = 'E';
+
+  int fixQuality = 0;
+
+  token = strtok(buffer, ",");
+
+  while (token != NULL)
+  {
+    switch (field)
+    {
+      case 2:
+        latitudeString = String(token);
+        break;
+
+      case 3:
+        if (strlen(token) > 0)
+          latitudeDirection = token[0];
+        break;
+
+      case 4:
+        longitudeString = String(token);
+        break;
+
+      case 5:
+        if (strlen(token) > 0)
+          longitudeDirection = token[0];
+        break;
+
+      case 6:
+        fixQuality = atoi(token);
+        break;
+    }
+
+    token = strtok(NULL, ",");
+    field++;
+  }
+
+  if (fixQuality > 0 &&
+      latitudeString.length() > 0 &&
+      longitudeString.length() > 0)
+  {
+    latitude = convertGPSCoordinate(
+                 latitudeString.toFloat(),
+                 latitudeDirection
+               );
+
+    longitude = convertGPSCoordinate(
+                  longitudeString.toFloat(),
+                  longitudeDirection
+                );
+
+    gpsFix = true;
+    gpsvalue = String(latitude, 6) + ", " + String(longitude, 6);
+    CloudLocation = Location(latitude, longitude);
+  }
+  else
+  {
+    gpsFix = false;
+  }
+}
+
+// ddmm.mmmm -> decimal degrees
+float convertGPSCoordinate(float rawCoordinate, char direction)
+{
+  int degrees = (int)(rawCoordinate / 100);
+
+  float minutes = rawCoordinate - (degrees * 100);
+
+  float decimalCoordinate =
+    degrees + (minutes / 60.0);
+
+  if (direction == 'S' || direction == 'W')
+  {
+    decimalCoordinate = -decimalCoordinate;
+  }
+
+  return decimalCoordinate;
+}
+
+void setup()
+{
+  Serial.begin(9600);
+
+  delay(1500);
+
+  gpsSerial.begin(9600);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(TDS_SENSOR_PIN, INPUT);
+  pinMode(TURBIDITY_PIN, INPUT);
+  pinMode(TEMPERATURE_SENSOR_PIN, INPUT);
+
+  temperatureSensor.begin();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  initProperties();
+
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("Water Monitoring System");
+  Serial.println("Arduino UNO R4 WiFi");
+  Serial.println("==============================");
+
+  Serial.println("DS18B20 initialized.");
+
+  if (temperatureSensor.getDeviceCount() == 0)
+  {
+    Serial.println("WARNING: DS18B20 not detected!");
+  }
+  else
+  {
+    Serial.print("DS18B20 sensors found: ");
+    Serial.println(temperatureSensor.getDeviceCount());
+  }
+}
+
+void loop()
+{
+  ArduinoCloud.update();
+
+  processGPS();
+
+  if (Scheduler.isActive()) {
+    // whenever the job is "active", turn on the LED
+    digitalWrite(LED_PIN, HIGH);
+  }else{
+    digitalWrite(LED_PIN, LOW);
+  }
+  // temperature
+  if (millis() - lastTemperatureTime >= 1000)
+  {
+    lastTemperatureTime = millis();
+
+    temperatureSensor.requestTemperatures();
+
+    float newTemperature =
+      temperatureSensor.getTempCByIndex(0);
+
+    if (newTemperature != DEVICE_DISCONNECTED_C)
+    {
+      waterTemperature = newTemperature;
+    }
+    else
+    {
+      Serial.println("ERROR: DS18B20 disconnected!");
+    }
+  }
+
+  // tds sampling
+  static unsigned long analogSampleTimepoint = millis();
+
+  if (millis() - analogSampleTimepoint >= 40)
+  {
+    analogSampleTimepoint = millis();
+
+    analogBuffer[analogBufferIndex] =
+      analogRead(TDS_SENSOR_PIN);
+
+    analogBufferIndex++;
+
+    if (analogBufferIndex >= SCOUNT)
+    {
+      analogBufferIndex = 0;
+    }
+  }
+
+  // tds calculation
+  if (millis() - lastTDSTime >= 800)
+  {
+    lastTDSTime = millis();
+
+    for (int i = 0; i < SCOUNT; i++)
+    {
+      analogBufferTemp[i] = analogBuffer[i];
+    }
+
+    int medianValue =
+      getMedianNum(analogBufferTemp, SCOUNT);
+
+    averageVoltage =
+      medianValue * VREF / 1024.0;
+
+    float compensationCoefficient =
+      1.0 + 0.02 *
+      (waterTemperature - 25.0);
+
+    float compensationVoltage =
+      averageVoltage /
+      compensationCoefficient;
+
+    tds =
+      (133.42 * compensationVoltage *
+       compensationVoltage *
+       compensationVoltage
+       - 255.86 * compensationVoltage *
+       compensationVoltage
+       + 857.39 * compensationVoltage)
+      * 0.5;
+
+    if (tds < 0)
+    {
+      tds = 0;
+    }
+
+    tdsValue = tds;
+  }
+
+  // turbidity
+  if (millis() - lastTurbidityTime >= 500)
+  {
+    lastTurbidityTime = millis();
+
+    int sensorValue =
+      analogRead(TURBIDITY_PIN);
+
+    turbidityVoltage =
+      sensorValue * (VREF / 1023.0);
+
+    turbidityNTU =
+      -1120.4 *
+      turbidityVoltage *
+      turbidityVoltage
+      + 5742.3 *
+      turbidityVoltage
+      - 4352.9;
+
+    if (turbidityNTU < 0)
+    {
+      turbidityNTU = -1;
+    }
+
+    turbidity = turbidityNTU;
+  }
+
+  // button (LOW = pressed because of INPUT_PULLUP)
+  int currentButtonState =
+    digitalRead(BUTTON_PIN);
+
+  if (currentButtonState == LOW)
+  {
+    buttonPressed = true;
+    butto = 1;
+  }
+  
+
+  lastButtonState = currentButtonState;
+  
+  // serial monitor output
+  if (millis() - lastPrintTime >= 2000)
+  {
+    lastPrintTime = millis();
+
+    Serial.println();
+    Serial.println("------------------------------");
+
+    Serial.print("TDS: ");
+    Serial.print(tdsValue, 1);
+    Serial.println(" ppm");
+
+    Serial.print("TDS Voltage: ");
+    Serial.print(averageVoltage, 3);
+    Serial.println(" V");
+
+    Serial.print("Temperature: ");
+    Serial.print(waterTemperature, 1);
+    Serial.println(" C");
+
+    Serial.print("Turbidity: ");
+    Serial.print(turbidity, 1);
+    Serial.println(" NTU");
+
+    Serial.print("Button: ");
+
+    if (butto == 1)
+    {
+      Serial.println("PRESSED");
+    }
+    else
+    {
+      Serial.println("RELEASED");
+    }
+
+    if (gpsFix)
+    {
+      Serial.print("GPS Latitude: ");
+      Serial.println(latitude, 6);
+
+      Serial.print("GPS Longitude: ");
+      Serial.println(longitude, 6);
+    }
+    else
+    {
+      Serial.println("GPS: Buoy 2");
+    }
+
+    Serial.println("------------------------------");
+  }
+  if (butto==1)
+  {
+    lastMessengerTime = millis();
+
+    String report = "[" + String(millis() / 1000) + "s] "
+                    + "HAPPY BOUY: 2"+ "|"
+                    + "Button: " + (butto == 1 ? "PRESSED ALERT" : "RELEASED") + " | ";
+    butto = 0;
+    if (gpsFix)
+      report += "GPS: " + String(latitude, 6) + ", " + String(longitude, 6);
+    else
+      report += "GPS: buoy 2";
+
+    messenger = report;
+  } // end if lastMessengerTime
+
+} // end loop
+
+void onWaterTemperatureChange()
+{
+}
+void onMessengerChange()
+{
+}
+void onCloudLocationChange()
+{
+}
+
+void onSchedulerChange()
+{
+}
+
+void onResetpanicbuttonChange()
+{
+  if (resetpanicbutton == true)
+  {
+    buttonPressed = false;
+    butto = 0;
+    resetpanicbutton = false;
+    Serial.println("Panic button reset via Cloud.");
+  }
+}
